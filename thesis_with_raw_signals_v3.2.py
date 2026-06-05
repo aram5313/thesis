@@ -1680,6 +1680,14 @@ class App(tk.Tk):
                   activeforeground="#0f1117", relief="flat", cursor="hand2",
                   command=self._export_3conditions_excel
                   ).pack(fill=tk.X, padx=18, pady=(0, 16))
+        tk.Button(sb, text="  BATCH: ALL SUBJECTS  ", font=("Courier", 9, "bold"),
+                  bg="#f59e0b", fg="#0f1117", activebackground="#fcd34d",
+                  activeforeground="#0f1117", relief="flat", cursor="hand2",
+                  command=self._batch_all_subjects
+                  ).pack(fill=tk.X, padx=18, pady=(0, 4))
+        tk.Label(sb, text="  Avg across all SxE in a folder",
+                 font=("Courier", 7), bg=SURFACE, fg=MUTED
+                 ).pack(anchor="w", padx=18, pady=(0, 16))
 
     # ── metric strip ──────────────────────────────────────────────────────────
 
@@ -3358,6 +3366,624 @@ class App(tk.Tk):
 
 
 # =============================================================================
+
+
+    def _batch_all_subjects(self):
+        """
+        GUI entry point for the batch benchmark.
+        User picks a folder containing NinaPro DB3 zip files (s1.zip … s11.zip).
+        For each zip → each exercise (E1/E2/E3) → runs the 3-condition sweep
+        (Static / Moderate / Stress) → aggregates mean ± std across subjects.
+        Writes a multi-sheet Excel workbook.
+        """
+        import tkinter.filedialog as fd
+        import datetime
+
+        folder = fd.askdirectory(
+            title="Select folder containing NinaPro DB3 zip files")
+        if not folder:
+            return
+
+        zips = sorted([
+            os.path.join(folder, f)
+            for f in os.listdir(folder)
+            if f.lower().endswith(".zip")
+        ])
+        if not zips:
+            messagebox.showerror(
+                "No zip files found",
+                f"No .zip files found in:\\n{folder}\\n\\n"
+                "Download NinaPro DB3 zips (s1.zip ... s11.zip) from "
+                "ninaweb.hevs.ch and place them in one folder.")
+            return
+
+        save_path = fd.asksaveasfilename(
+            title="Save batch results",
+            defaultextension=".xlsx",
+            initialfile=(
+                f"emg_batch_"
+                f"{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"),
+            filetypes=[("Excel workbook", "*.xlsx"), ("All files", "*.*")])
+        if not save_path:
+            return
+
+        self.status_var.set(
+            f"Batch: found {len(zips)} zip(s) — starting run...")
+        self.update_idletasks()
+
+        try:
+            self._run_batch_folder(zips, save_path)
+            self.status_var.set(
+                f"Batch complete \\u2192 {os.path.basename(save_path)}")
+            messagebox.showinfo(
+                "Batch complete",
+                f"Results saved to:\\n{save_path}\\n\\n"
+                "Sheets:\\n"
+                "  Summary     — grand mean \\u00b1 std (all subjects, per exercise)\\n"
+                "  E1 / E2 / E3 — per-exercise mean \\u00b1 std across subjects\\n"
+                "  Per-Subject — every subject \\u00d7 exercise \\u00d7 condition row\\n"
+                "  Params      — parameter snapshot")
+        except Exception as exc:
+            import traceback
+            messagebox.showerror("Batch failed", str(exc))
+            self.status_var.set("Batch failed — see error dialog")
+            traceback.print_exc()
+
+    def _run_batch_folder(self, zip_paths, save_path):
+        """
+        Core batch loop.
+
+        Iterates: subject zip -> exercise (E1/E2/E3) -> condition (Static/Moderate/Stress)
+        -> all 9 algorithms.
+
+        Collected structure:
+          results[subject_id][exercise_id][condition_name][algo_key][metric_key] = float
+        """
+        import zipfile
+        import tempfile
+        import numpy as np
+
+        p  = self._get_params()
+        fs = 2000   # NinaPro DB3 native fs
+
+        METRICS   = ["snr", "rmse", "r", "latency"]
+        EX_IDS    = ["E1", "E2", "E3"]
+        ALGO_KEYS = list(ALGO_NAMES.keys())
+        COND_LIST = [name for name, _, _ in THREE_CONDITIONS]
+
+        results = {}
+        total   = len(zip_paths) * len(EX_IDS) * len(COND_LIST)
+        done    = 0
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for zip_path in zip_paths:
+                # Build a normalised subject tag, e.g. "S01"
+                base   = os.path.splitext(os.path.basename(zip_path))[0].upper()
+                digits = "".join(c for c in base if c.isdigit())
+                subj   = f"S{int(digits):02d}" if digits else base
+
+                subj_dir = os.path.join(tmpdir, subj)
+                os.makedirs(subj_dir, exist_ok=True)
+                try:
+                    with zipfile.ZipFile(zip_path, "r") as zf:
+                        zf.extractall(subj_dir)
+                except Exception as e:
+                    self.status_var.set(f"Skipping {subj}: {e}")
+                    self.update_idletasks()
+                    done += len(EX_IDS) * len(COND_LIST)
+                    continue
+
+                results[subj] = {}
+
+                for ex_id in EX_IDS:
+                    # Find the .mat file whose name contains _E1_, _E2_, or _E3_
+                    mat_candidates = [
+                        fp for fp in self._walk_files(subj_dir)
+                        if fp.lower().endswith(".mat")
+                        and f"_{ex_id}_".lower() in os.path.basename(fp).lower()
+                    ]
+                    if not mat_candidates:
+                        done += len(COND_LIST)
+                        continue
+
+                    try:
+                        emg_data, _, _, ch2_data, _, _ = load_emg_file(
+                            mat_candidates[0], fs)
+                    except Exception as e:
+                        self.status_var.set(
+                            f"Load error {subj}/{ex_id}: {e}")
+                        self.update_idletasks()
+                        done += len(COND_LIST)
+                        continue
+
+                    n_max   = int(fs * 30.0)
+                    clean   = emg_data[:n_max].copy()
+                    n       = len(clean)
+                    ch2_raw = ch2_data[:n].copy() if ch2_data is not None else None
+
+                    results[subj][ex_id] = {}
+
+                    for cond_name, _, cond_overrides in THREE_CONDITIONS:
+                        self.status_var.set(
+                            f"  {subj} / {ex_id} / {cond_name}  "
+                            f"({done + 1}/{total})")
+                        self.update_idletasks()
+
+                        p_eff = {**p, **cond_overrides}
+
+                        art, times, interval = gen_artefact(
+                            fs, n,
+                            p_eff["stim_freq"],
+                            p_eff["art_amp"],
+                            emg_amp=p_eff["emg_amp"] * p_eff["mwave_pct"],
+                            latency_jitter_ms=p_eff.get("dyn_jitter_ms", 0.0),
+                            fatigue_pct      =p_eff.get("dyn_fatigue",   0.0),
+                            shape_morph_pct  =p_eff.get("dyn_morph",     0.0),
+                            tau_jitter_pct   =p_eff.get("dyn_tau",       0.0),
+                        )
+
+                        ch1 = clean + art + np.random.randn(n) * 5e-6
+
+                        if ch2_raw is not None:
+                            art_ch2 = art * (0.92 + np.random.randn() * 0.02)
+                            ch2     = ch2_raw + art_ch2 + np.random.randn(n) * 5e-6
+                        else:
+                            ch2 = make_ch2(
+                                clean, art, fs,
+                                emg_amp=p_eff["emg_amp"] * p_eff["mwave_pct"])
+
+                        cond_row = {}
+                        for algo in ALGO_KEYS:
+                            try:
+                                out, lat = self._run_algo(
+                                    algo, ch1, ch2, times, interval, fs, p_eff)
+                                m = compute_metrics(
+                                    clean, out, algo,
+                                    p_eff["blank_ms"], p_eff["stim_freq"],
+                                    times=times, fs=fs, mode="inter", art=art)
+                                m["latency"] = lat
+                                cond_row[algo] = {k: float(m[k]) for k in METRICS}
+                            except Exception:
+                                cond_row[algo] = {
+                                    k: float("nan") for k in METRICS}
+
+                        results[subj][ex_id][cond_name] = cond_row
+                        done += 1
+
+        self.status_var.set("Writing Excel workbook...")
+        self.update_idletasks()
+        _BatchResultsWriter(results, save_path, p).write()
+
+    @staticmethod
+    def _walk_files(root):
+        """Yield all file paths under root (recursive)."""
+        for dirpath, _, filenames in os.walk(root):
+            for fn in filenames:
+                yield os.path.join(dirpath, fn)
+
+    @staticmethod
+    def _run_algo(algo, ch1, ch2, times, interval, fs, p):
+        """Dispatch to the correct algorithm function."""
+        dispatch = {
+            "blank"   : lambda: algo_blanking(
+                            ch1, times, fs, p["blank_ms"]),
+            "template": lambda: algo_fixed_template(
+                            ch1, times, interval, fs, p["n_avg"]),
+            "ewma"    : lambda: algo_ewma_template(
+                            ch1, times, interval, fs, p["ewma_alpha"]),
+            "destd"   : lambda: algo_destd(ch1, ch2, times, interval, fs),
+            "gso"     : lambda: algo_gso(ch1, ch2, times, interval, fs),
+            "lms"     : lambda: algo_lms(
+                            ch1, ch2, times, interval, fs, p["lms_mu"]),
+            "enlms"   : lambda: algo_enlms(
+                            ch1, ch2, times, interval, fs, p["lms_mu"]),
+            "rls"     : lambda: algo_rls(
+                            ch1, ch2, times, interval, fs, p["rls_lam"]),
+            "ceemdan" : lambda: algo_ceemdan(
+                            ch1, times, interval, fs, p["stim_freq"]),
+        }
+        return dispatch[algo]()
+
+
+# =============================================================================
+#  _BatchResultsWriter  (module-level, outside App)
+# =============================================================================
+
+
+class _BatchResultsWriter:
+    """
+    Writes batch benchmark results to a formatted .xlsx workbook.
+
+    Sheets
+    ------
+    Summary      Grand mean +/- std across ALL subjects & exercises.
+    E1 / E2 / E3 Per-exercise mean +/- std across subjects.
+    Per-Subject  Every (subject, exercise, condition, algorithm) row.
+    Params       GUI parameter snapshot.
+    """
+
+    METRICS    = ["snr", "rmse", "r", "latency"]
+    MET_LABELS = {
+        "snr"    : ("SNR",      "dB",    True),
+        "rmse"   : ("RMSE",     "uV",    False),
+        "r"      : ("Pearson r","",      True),
+        "latency": ("Latency",  "ms/s",  False),
+    }
+    CONDITIONS = ["Static", "Moderate", "Stress"]
+    ALGO_ORDER = [
+        "blank", "template", "ewma", "destd",
+        "gso", "lms", "enlms", "rls", "ceemdan",
+    ]
+    ALGO_HEX = {
+        "blank"   : "6B7280", "template": "94A3B8", "ewma"    : "38BDF8",
+        "destd"   : "6C8FFF", "gso"     : "34D399", "lms"     : "A78BFA",
+        "enlms"   : "C084FC", "rls"     : "F97316", "ceemdan" : "FB7185",
+    }
+
+    def __init__(self, results, path, params):
+        self.results = results
+        self.path    = path
+        self.params  = params
+
+    # ── public entry ──────────────────────────────────────────────────
+    def write(self):
+        try:
+            from openpyxl import Workbook
+            from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+            from openpyxl.utils import get_column_letter
+        except ImportError:
+            raise RuntimeError(
+                "openpyxl not installed.  Run: pip install openpyxl")
+
+        import datetime
+        import numpy as np
+
+        self._np    = np
+        self._Font  = Font
+        self._Fill  = PatternFill
+        self._Align = Alignment
+        self._Bord  = Border
+        self._Side  = Side
+        self._gcol  = get_column_letter
+        self._ts    = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        wb       = Workbook()
+        self._agg = self._aggregate()
+
+        self._sheet_summary(wb.active)
+        for ex in ["E1", "E2", "E3"]:
+            self._sheet_exercise(wb.create_sheet(ex), ex)
+        self._sheet_per_subject(wb.create_sheet("Per-Subject"))
+        self._sheet_params(wb.create_sheet("Params"))
+        wb.save(self.path)
+
+    # ── aggregation ────────────────────────────────────────────────────
+    def _aggregate(self):
+        np  = self._np
+        res = self.results
+
+        # Collect raw values per exercise
+        vals = {
+            ex: {
+                c: {a: {m: [] for m in self.METRICS} for a in self.ALGO_ORDER}
+                for c in self.CONDITIONS
+            }
+            for ex in ["E1", "E2", "E3"]
+        }
+
+        for subj in res:
+            for ex in res[subj]:
+                if ex not in vals:
+                    continue
+                for cond in res[subj][ex]:
+                    for algo in res[subj][ex][cond]:
+                        if algo not in self.ALGO_ORDER:
+                            continue
+                        for metric in self.METRICS:
+                            v = res[subj][ex][cond][algo].get(
+                                metric, float("nan"))
+                            if not np.isnan(v):
+                                vals[ex][cond][algo][metric].append(v)
+
+        def stats(data):
+            if data:
+                return {
+                    "mean": float(np.mean(data)),
+                    "std" : float(np.std(data, ddof=1)
+                                  if len(data) > 1 else 0.0),
+                    "n"   : len(data),
+                }
+            return {"mean": float("nan"), "std": float("nan"), "n": 0}
+
+        agg = {}
+        for ex in ["E1", "E2", "E3"]:
+            agg[ex] = {
+                c: {
+                    a: {m: stats(vals[ex][c][a][m]) for m in self.METRICS}
+                    for a in self.ALGO_ORDER
+                }
+                for c in self.CONDITIONS
+            }
+
+        # Grand mean: average the per-exercise means
+        agg["ALL"] = {}
+        for c in self.CONDITIONS:
+            agg["ALL"][c] = {}
+            for a in self.ALGO_ORDER:
+                agg["ALL"][c][a] = {}
+                for m in self.METRICS:
+                    sub_means = [
+                        agg[ex][c][a][m]["mean"]
+                        for ex in ["E1", "E2", "E3"]
+                        if not np.isnan(agg[ex][c][a][m]["mean"])
+                    ]
+                    agg["ALL"][c][a][m] = stats(sub_means)
+
+        return agg
+
+    # ── style helpers ──────────────────────────────────────────────────
+    def _fill(self, h):
+        return self._Fill("solid", fgColor=h)
+
+    def _font(self, sz=9, bold=False, color="111111"):
+        return self._Font(name="Calibri", size=sz, bold=bold, color=color)
+
+    def _hdr(self, sz=9):
+        return self._Font(name="Calibri", size=sz, bold=True, color="FFFFFF")
+
+    def _ctr(self):
+        return self._Align(horizontal="center", vertical="center",
+                           wrap_text=True)
+
+    def _lft(self):
+        return self._Align(horizontal="left", vertical="center",
+                           wrap_text=False)
+
+    def _bdr(self):
+        s = self._Side(style="thin", color="CCCCCC")
+        return self._Bord(left=s, right=s, top=s, bottom=s)
+
+    def _title_row(self, ws, text, n_cols, row=1):
+        ws.merge_cells(start_row=row, start_column=1,
+                       end_row=row, end_column=n_cols)
+        c = ws.cell(row=row, column=1, value=text)
+        c.font      = self._Font(name="Calibri", size=11, bold=True,
+                                  color="FFFFFF")
+        c.fill      = self._fill("0F1117")
+        c.alignment = self._ctr()
+        ws.row_dimensions[row].height = 22
+
+    # ── metric block helper (used by Summary + per-exercise sheets) ────
+    def _write_metric_block(self, ws, start_row, metric, agg_key):
+        """Write one metric block (header + 9 algo rows).  Returns next row."""
+        np     = self._np
+        label, unit, higher = self.MET_LABELS[metric]
+        n_cols = 10   # algo + n + 3*(mean,std) + 2 deltas
+
+        # Metric section header
+        ws.merge_cells(start_row=start_row, start_column=1,
+                       end_row=start_row, end_column=n_cols)
+        c = ws.cell(row=start_row, column=1,
+                    value=f"  {label}  ({unit})  "
+                          f"[{'higher = better' if higher else 'lower = better'}]")
+        c.font      = self._font(10, bold=True, color="FFFFFF")
+        c.fill      = self._fill("1A3050")
+        c.alignment = self._lft()
+        c.border    = self._bdr()
+        ws.row_dimensions[start_row].height = 18
+        row = start_row + 1
+
+        # Column headers
+        col_headers = [
+            "Algorithm", "n",
+            "Static mean", "+/-std",
+            "Moderate mean", "+/-std",
+            "Stress mean", "+/-std",
+            "Delta S->Mod", "Delta S->Str",
+        ]
+        col_widths = [22, 6, 15, 10, 15, 10, 15, 10, 16, 16]
+        for ci, (h, w) in enumerate(zip(col_headers, col_widths), 1):
+            ws.column_dimensions[self._gcol(ci)].width = w
+            c = ws.cell(row=row, column=ci, value=h)
+            c.font      = self._hdr()
+            c.fill      = self._fill("1A1D2A")
+            c.alignment = self._ctr()
+            c.border    = self._bdr()
+        ws.row_dimensions[row].height = 20
+        row += 1
+
+        # Algorithm rows
+        for algo in self.ALGO_ORDER:
+            c = ws.cell(row=row, column=1, value=ALGO_NAMES.get(algo, algo))
+            c.font      = self._font(9, bold=True, color=self.ALGO_HEX[algo])
+            c.fill      = self._fill("1C1F2C")
+            c.alignment = self._lft()
+            c.border    = self._bdr()
+
+            n_val = self._agg[agg_key][self.CONDITIONS[0]][algo][metric]["n"]
+            c2 = ws.cell(row=row, column=2, value=n_val)
+            c2.font = self._font(9, color="AAAAAA")
+            c2.fill = self._fill("1C1F2C")
+            c2.alignment = self._ctr()
+            c2.border = self._bdr()
+
+            means = []
+            col   = 3
+            for cond in self.CONDITIONS:
+                d  = self._agg[agg_key][cond][algo][metric]
+                mu = d["mean"]
+                sd = d["std"]
+                means.append(mu)
+                for v in (mu, sd):
+                    cell = ws.cell(row=row, column=col)
+                    if np.isnan(v):
+                        cell.value = "—"
+                        cell.font  = self._font(9, color="555555")
+                    else:
+                        cell.value          = round(v, 4)
+                        cell.number_format  = "0.00"
+                        cell.font           = self._font(9, color="DDDDDD")
+                    cell.fill      = self._fill("1C1F2C")
+                    cell.alignment = self._ctr()
+                    cell.border    = self._bdr()
+                    col += 1
+
+            # Delta columns
+            for c1, c2i in [(0, 1), (0, 2)]:
+                cell  = ws.cell(row=row, column=col)
+                delta = (means[c2i] - means[c1]
+                         if not any(np.isnan([means[c1], means[c2i]]))
+                         else float("nan"))
+                if np.isnan(delta):
+                    cell.value = "—"
+                    cell.font  = self._font(9, color="555555")
+                    cell.fill  = self._fill("1C1F2C")
+                else:
+                    cell.value         = round(delta, 3)
+                    cell.number_format = "+0.00;-0.00"
+                    if abs(delta) < 1e-6:
+                        bg, fc = "1C1F2C", "DDDDDD"
+                    elif (higher and delta < 0) or (not higher and delta > 0):
+                        bg, fc = "5A1A1A", "FFAAAA"   # degradation = red
+                    else:
+                        bg, fc = "1A5A1A", "AAFFAA"   # improvement = green
+                    cell.fill = self._fill(bg)
+                    cell.font = self._font(9, bold=True, color=fc)
+                cell.alignment = self._ctr()
+                cell.border    = self._bdr()
+                col += 1
+
+            ws.row_dimensions[row].height = 16
+            row += 1
+
+        return row + 1   # blank spacer
+
+    # ── Summary sheet ──────────────────────────────────────────────────
+    def _sheet_summary(self, ws):
+        ws.title = "Summary"
+        ws.sheet_view.showGridLines = False
+        n_subj = len(self.results)
+        self._title_row(
+            ws,
+            f"NinaPro DB3 — Grand mean +/- std  "
+            f"({n_subj} subjects, all exercises)  {self._ts}",
+            n_cols=10)
+        ws.row_dimensions[2].height = 6
+        row = 3
+        for metric in self.METRICS:
+            row = self._write_metric_block(ws, row, metric, "ALL")
+
+    # ── Per-exercise sheets ────────────────────────────────────────────
+    def _sheet_exercise(self, ws, ex_id):
+        ws.sheet_view.showGridLines = False
+        n_subj = len(self.results)
+        self._title_row(
+            ws,
+            f"Exercise {ex_id} — mean +/- std across {n_subj} subjects  "
+            f"{self._ts}",
+            n_cols=10)
+        ws.row_dimensions[2].height = 6
+        row = 3
+        for metric in self.METRICS:
+            row = self._write_metric_block(ws, row, metric, ex_id)
+
+    # ── Per-subject raw data ───────────────────────────────────────────
+    def _sheet_per_subject(self, ws):
+        ws.sheet_view.showGridLines = False
+        headers = [
+            "Subject", "Exercise", "Condition", "Algorithm",
+            "SNR (dB)", "RMSE (uV)", "Pearson r", "Latency (ms/s)",
+        ]
+        widths = [10, 10, 12, 20, 14, 14, 14, 16]
+
+        for ci, (h, w) in enumerate(zip(headers, widths), 1):
+            ws.column_dimensions[self._gcol(ci)].width = w
+            c = ws.cell(row=1, column=ci, value=h)
+            c.font = self._hdr(); c.fill = self._fill("1A1D2A")
+            c.alignment = self._ctr(); c.border = self._bdr()
+        ws.row_dimensions[1].height = 20
+        ws.freeze_panes = "A2"
+
+        row = 2
+        for subj in sorted(self.results):
+            for ex in ["E1", "E2", "E3"]:
+                if ex not in self.results[subj]:
+                    continue
+                for cond in self.CONDITIONS:
+                    if cond not in self.results[subj][ex]:
+                        continue
+                    for algo in self.ALGO_ORDER:
+                        m   = self.results[subj][ex][cond].get(algo, {})
+                        bg  = "181B27" if row % 2 == 0 else "1C1F2C"
+                        row_vals = [
+                            subj, ex, cond, ALGO_NAMES.get(algo, algo),
+                            m.get("snr",     float("nan")),
+                            m.get("rmse",    float("nan")),
+                            m.get("r",       float("nan")),
+                            m.get("latency", float("nan")),
+                        ]
+                        for ci, v in enumerate(row_vals, 1):
+                            c = ws.cell(row=row, column=ci)
+                            if isinstance(v, float):
+                                if self._np.isnan(v):
+                                    c.value = "—"
+                                    c.font  = self._font(9, color="555555")
+                                else:
+                                    c.value         = round(v, 4)
+                                    c.number_format = "0.0000"
+                                    c.font          = self._font(9,
+                                                          color="DDDDDD")
+                            else:
+                                c.value = v
+                                c.font  = self._font(9, color="DDDDDD")
+                            c.fill      = self._fill(bg)
+                            c.alignment = self._ctr()
+                            c.border    = self._bdr()
+                        ws.row_dimensions[row].height = 14
+                        row += 1
+
+    # ── Params sheet ───────────────────────────────────────────────────
+    def _sheet_params(self, ws):
+        ws.sheet_view.showGridLines = False
+        ws.column_dimensions["A"].width = 28
+        ws.column_dimensions["B"].width = 30
+
+        rows = [
+            ("Timestamp",         self._ts),
+            ("Subjects processed",
+             ", ".join(sorted(self.results.keys()))),
+            ("n subjects",        len(self.results)),
+            ("fs (Hz)",           2000),
+            ("Stim freq (Hz)",    self.params["stim_freq"]),
+            ("Art amp (mV)",      round(self.params["art_amp"] * 1000, 1)),
+            ("EMG amp (uV RMS)",  round(self.params["emg_amp"] * 1e6, 1)),
+            ("M-wave scale (%)",  round(self.params["mwave_pct"] * 100, 1)),
+            ("Blank window (ms)", self.params["blank_ms"]),
+            ("n_avg",             self.params["n_avg"]),
+            ("EWMA alpha",        round(self.params["ewma_alpha"], 4)),
+            ("LMS mu",            round(self.params["lms_mu"], 4)),
+            ("RLS lambda",        round(self.params["rls_lam"], 4)),
+            ("Metric mode",       "inter-stim, 30 ms guard"),
+            ("Static",            "jitter=0, fatigue=0, morph=0, tau=0"),
+            ("Moderate",
+             "jitter=1ms, fatigue=15%, morph=5%, tau=15%"),
+            ("Stress",
+             "jitter=2ms, fatigue=30%, morph=15%, tau=30%"),
+        ]
+        for ri, (k, v) in enumerate(rows, 1):
+            c = ws.cell(row=ri, column=1, value=k)
+            c.font = self._font(9, color="AAAAAA")
+            c.fill = self._fill("1C1F2C")
+            c.alignment = self._lft()
+            c.border = self._bdr()
+            c = ws.cell(row=ri, column=2, value=v)
+            c.font = self._font(10, bold=True, color="6C8FFF")
+            c.fill = self._fill("181B27")
+            c.alignment = (self._lft() if isinstance(v, str)
+                           else self._ctr())
+            c.border = self._bdr()
+            ws.row_dimensions[ri].height = 18
+
 
 if __name__ == "__main__":
     np.random.seed(42)

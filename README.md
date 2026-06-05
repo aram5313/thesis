@@ -1,161 +1,133 @@
-# thesis
-
 # EMG Artefact Suppression — Thesis Repository
 
-Real-time stimulus artefact rejection and suppression for surface EMG signals contaminated by transcutaneous electrical stimulation. This repo contains all working code, benchmark results, datasets, and ongoing change plans for the thesis.
+Real-time stimulation artefact suppression for surface EMG signals contaminated by transcutaneous electrical stimulation. This repository contains the benchmark pipeline, results, and visualisation tools developed for the thesis.
 
-> **Status:** active development. Results and methodology are evolving — see [`CHANGELOG`](#changelog) and [`Planned changes`](#planned-changes) for what's stable and what's in flux.
+> **Thesis:** *Development of a Closed-Loop EMG Recording and Stimulation System with Real-Time Artefact Suppression Beyond Blanking* — Ayush Ram, University of Sydney, BEng Biomedical Honours.
 
 ---
 
-## Overview
+## Key files
 
-This project benchmarks a range of artefact-suppression algorithms for EMG signals contaminated by stimulation artefacts, evaluated against literature targets from Wang 2021, Chen 2023, Sennels 1997, Mandrile 2003, Limnuson 2014, Liu 2014/2025, and Andrews 2023.
+The following files are the core deliverables of this benchmark. Other source files, patch scripts, and exploratory notebooks exist in the repo but these four are the main outputs.
 
-Algorithms currently implemented:
+| File | What it is |
+|---|---|
+| `thesis_with_raw_signals_v3_2.py` | Main benchmark GUI. Loads NinaPro DB3 `.mat` files, injects synthetic stimulation artefacts with controllable dynamics (jitter, fatigue, shape morphing, tau variation), runs all 9 algorithms, and exports results. Also includes the **BATCH: ALL SUBJECTS** button for running across all 11 subjects automatically. |
+| `results_visualiser__2_.py` | Standalone results viewer. Load either a single-run Excel (3-condition sweep) or a batch Excel — auto-detected. Renders bar charts, degradation lines, scatter plots, latency rankings, delta heatmap, and radar fingerprints. Batch mode adds ±std error bars and shaded bands across subjects. |
+| `emg_batch_20260605_121247.xlsx` | Full benchmark results — 891 runs (11 subjects × 3 exercises × 3 conditions × 9 algorithms). Summary sheet gives grand mean ± std. Per-Subject sheet contains every individual run. |
+| `full_subject_emg_analysis.pdf` | 15-page publication-quality report generated from the batch results — bar charts with error bars, degradation trajectories, RMSE × Pearson r scatter, latency rankings, delta heatmap, and radar fingerprints across all three conditions. |
 
-- Blanking (baseline)
-- Fixed-template subtraction
-- EWMA (exponentially weighted moving average) template subtraction
-- Dual-channel DESTD
-- Gram–Schmidt orthogonalisation (GSO)
-- LMS, ε-NLMS, RLS adaptive filters
-- CEEMDAN
+---
 
-Each algorithm is evaluated under multiple metric "modes" corresponding to different evaluation conventions in the literature (Wang/Chen, Sennels, Liu ASR, Mandrile, Limnuson, Andrews).
+## Algorithms benchmarked
+
+| # | Algorithm | Category |
+|---|---|---|
+| 1 | Blanking | Baseline |
+| 2 | Fixed template subtraction | Template |
+| 3 | EWMA template subtraction | Template |
+| 4 | Dual-channel DESTD | Spatial |
+| 5 | Gram–Schmidt Orthogonalisation (GSO) | Spatial |
+| 6 | LMS adaptive filter | Adaptive |
+| 7 | ε-NLMS adaptive filter | Adaptive |
+| 8 | RLS adaptive filter | Adaptive |
+| 9 | CEEMDAN (AA-IF) | Decomposition |
+
+**Metrics:** SNR (dB) · RMSE (µV) · Pearson r · Latency (ms/s)
+
+**Key finding:** GSO was the only algorithm whose performance was statistically invariant across all three conditions (ΔSNR = +0.02 dB, Static → Stress), confirmed across all 11 NinaPro DB3 subjects and three exercise types.
+
+---
+
+## Dataset
+
+**NinaPro DB3** — 11 subjects, 12-channel surface EMG at 2000 Hz (Delsys Trigno electrodes).
+
+Download all 11 subject zip files from the official NinaPro site:
+
+> **https://ninapro.hevs.ch/instructions/DB3.html**
+
+Once downloaded, place all zips into a single folder (do **not** unzip them — the pipeline handles extraction automatically):
+
+```
+ninapro_db3/
+├── s1_0.zip
+├── s2_0.zip
+├── s3_0.zip
+    ...
+└── s11_0.zip
+```
+
+Then open `thesis_with_raw_signals_v3_2.py`, click **BATCH: ALL SUBJECTS**, and point it at that folder.
+
+> NinaPro data is not redistributed in this repo. Download from the official site and place under your local data folder before running.
 
 ---
 
 ## Requirements
 
-- **Python 3.11.9**
-- See [`requirements.txt`](requirements.txt) for the full pin list.
-
-Recommended setup:
+- Python 3.11+
+- numpy · scipy · pandas · matplotlib · openpyxl · tkinter
 
 ```bash
-python3.11 -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
-pip install --upgrade pip
-pip install -r requirements.txt
+pip install numpy scipy pandas matplotlib openpyxl
 ```
 
----
-
-## Repository structure
-
-```
-.
-├── src/                     # Algorithm implementations
-├── benchmarks/              # Benchmark runner + metric definitions
-├── data/                    # Ninapro segments and synthetic test signals
-│   ├── ninapro/             # Raw Ninapro .mat files (rest segments used as noise)
-│   └── synthetic/           # Generated test signals
-├── results/                 # Exported benchmark spreadsheets (.xlsx)
-├── notebooks/               # Exploratory analysis and figure generation
-├── docs/                    # Thesis-related notes, planned changes, references
-├── versions/                # Frozen historical versions of the pipeline
-└── README.md
-```
-
----
-
-## Datasets
-
-Primary dataset: **Ninapro DB** (subject `S1_E1_A1` and others, 12-channel sEMG @ 2000 Hz).
-
-The pipeline uses two noise regimes:
-
-1. **Static synthetic noise** — Gaussian noise added to clean templates. Used for early validation only; results in `results/2026-04-27_static/`.
-2. **Dynamic noise from Ninapro rest segments** — rest-period segments from Ninapro are used directly as the noise source, on the basis that these segments contain no active contraction or stimulation and therefore approximate realistic background activity. Current default; results in `results/2026-05-07_dynamic/`.
-
-> Ninapro raw data is **not redistributed** in this repo. Download from the official Ninapro site and place under `data/ninapro/`.
+tkinter is included with most Python installations. If missing on Linux: `sudo apt install python3-tk`.
 
 ---
 
 ## Running the benchmark
 
-From the repo root:
-
+**Single subject (interactive):**
 ```bash
-# Run the full benchmark suite on the default dataset
-python -m benchmarks.run
-
-# Specify a Ninapro file
-python -m benchmarks.run --data data/ninapro/S1_E1_A1.mat
-
-# Override key parameters
-python -m benchmarks.run --fs 2000 --stim 50 --blank-ms 5 --n-avg 10
+python thesis_with_raw_signals_v3_2.py
 ```
+Load any NinaPro DB3 `.mat` file via the GUI, adjust sliders, and run individual algorithms or the full 3-condition sweep.
 
-Results are exported as a timestamped `.xlsx` into `results/`, with sheets:
+**All 11 subjects (batch):**
+1. Download all 11 NinaPro DB3 zips into one folder
+2. Open the GUI, click **BATCH: ALL SUBJECTS**
+3. Select the folder containing the zips
+4. Choose a save path for the output Excel
+5. Wait ~10–30 min — progress shows in the status bar
 
-- `All Metrics` — algorithm × metric matrix vs literature targets
-- `Raw Data` — long-format per-mode results
-- `Literature Targets` — reference values from the cited papers
-- `Params` — run configuration
-
----
-
-## Reproducing reported results
-
-| Run | Date | Data | Notes |
-|-----|------|------|-------|
-| Static-noise baseline | 2026-04-27 | Synthetic, 4 kHz | Early validation, near-zero Pearson r across most methods |
-| Dynamic-noise (current) | 2026-05-07 | Ninapro `S1_E1_A1.mat`, 2 kHz | Substantial improvement; some results still under verification |
-
-To reproduce the dynamic-noise run:
-
+**Viewing results:**
 ```bash
-python -m benchmarks.run --data data/ninapro/S1_E1_A1.mat --noise dynamic
+python results_visualiser__2_.py
 ```
+Click **Load Excel File** and select either the batch Excel or any single-run export.
 
 ---
 
-## Planned changes
+## Three-condition benchmark
 
-Tracked in [`docs/CHANGES.md`](docs/CHANGES.md). Headline items:
+Results are reported across three escalating artefact conditions, anchored to literature:
 
-- [ ] Verify dynamic-noise import and alignment — some metrics in the 2026-05-07 run still look off and may reflect a pipeline issue rather than algorithmic behaviour.
-- [ ] Sweep across additional Ninapro subjects, not just `S1_E1_A1`.
-- [ ] Add statistical significance testing (paired comparisons across subjects).
-- [ ] Tighten parameter defaults per algorithm (LMS μ, RLS λ) based on per-subject behaviour.
-- [ ] Add real-time latency profiling on representative hardware.
-- [ ] Script finalisation (due Monday).
+| Condition | Jitter | Fatigue | Shape morph | Tau jitter |
+|---|---|---|---|---|
+| Static | 0 ms | 0% | 0% | 0% |
+| Moderate | ±1 ms | 15% | 5% | 15% |
+| Stress | ±2 ms | 30% | 15% | 30% |
 
----
-
-## Versions
-
-Historical, frozen pipeline versions live in `versions/` for reference and reproducibility. The active version is at the repo root. Each frozen version has its own README noting what changed and why it was retired.
-
----
-
-## Changelog
-
-- **2026-05-07** — Switched default noise source to Ninapro rest segments (dynamic noise). Results improved substantially on real data; verification of import pipeline ongoing.
-- **2026-04-27** — Static synthetic-noise benchmark established as baseline.
-- *Earlier* — Initial implementations of blanking, template subtraction, and adaptive filter families.
+Moderate and Stress parameters are anchored to Sennels 1997 Fig. 9 (worst-case amplitude/tau variation) and Sensors 2021 (DESTD realistic FES protocol).
 
 ---
 
 ## References
 
-Key papers driving the metric targets and methodology:
-
-- Wang et al., 2021 — GS-APEF / LMS-AF
-- Chen et al., 2023 — DESTD
-- Sennels et al., 1997 — Adaptive M-stage filtering
-- Mandrile et al., 2003 — ARV-based contamination metric
-- Limnuson et al., 2014 — IIR template subtraction (FPGA)
-- Liu et al., 2014 — Savitzky–Golay M-wave recovery
-- Liu et al., 2025 — Pole-shifting / fixed-template ASIC
-- Andrews et al., 2023 — AA-IF / EMD-BF FFT preservation
-
-Full reference list: [`docs/references.bib`](docs/references.bib).
+| Paper | Role in benchmark |
+|---|---|
+| Wang et al. 2021 | GS-APEF / LMS-AF — GSO and LMS metric targets |
+| Chen et al. 2023 | DESTD — spatial subtraction and GSO FPGA validation |
+| Sennels et al. 1997 | Adaptive M-stage filtering — Stress condition anchoring |
+| Mandrile et al. 2003 | ARV-based contamination metric — Blanking characterisation |
+| Limnuson et al. 2014 | IIR template subtraction FPGA — EWMA parameter justification |
+| Liu et al. 2025 | Randles-model ASIC — artefact tail model (τ = 5 ms) |
+| Andrews et al. 2023 | AA-IF / EMD-BF — CEEMDAN implementation and FFT metric |
 
 ---
 
-## License & use
+## License
 
-Thesis research code. Not currently licensed for redistribution. Contact the author before reuse.
+Thesis research code. Not licensed for redistribution. Contact the author before reuse.
